@@ -94,6 +94,8 @@ mp3_cut.py config.json
   -map_metadata -1 \
   -vn \
   -c copy \
+  -write_xing 0 \
+  -id3v2_version 0 \
   <output>
 ```
 
@@ -101,7 +103,10 @@ mp3_cut.py config.json
 
 ### 方針
 * `-c copy` により再エンコードを行わない
-* `-map_metadata -1` により全メタデータを削除する
+* `-map_metadata -1` により入力メタデータを破棄する
+* `-write_xing 0` により muxer のダミー Info/Xing フレームを書かない
+* `-id3v2_version 0` により ID3v2 タグを付けない
+* 切り出し後、末尾に連なる LAME/Xing/Info フレームを取り除く
 * 音声ストリームのみを出力対象とする
 
 ---

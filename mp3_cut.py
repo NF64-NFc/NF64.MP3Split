@@ -8,7 +8,15 @@ import sys
 import json
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
+
+
+# MPEG-1 Layer III のビットレート表 (kbps)。インデックス 0 と 15 は無効。
+_MPEG1_L3_BITRATES: List[int] = [
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+]
+# MPEG-1 のサンプリングレート表 (Hz)
+_MPEG1_SAMPLE_RATES: List[int] = [44100, 48000, 32000]
 
 
 def parse_time_to_seconds(time_str: str) -> float:
@@ -134,9 +142,144 @@ def get_ffmpeg_executable() -> str:
     return ffmpeg_exe
 
 
+def _id3v2_size(data: bytes) -> int:
+    """
+    先頭の ID3v2 タグ長を返す。タグが無ければ 0。
+
+    Args:
+        data: MP3 ファイルのバイト列
+
+    Returns:
+        音声データ開始オフセット
+    """
+    if len(data) < 10 or data[:3] != b"ID3":
+        return 0
+    size = (
+        (data[6] & 0x7F) << 21
+        | (data[7] & 0x7F) << 14
+        | (data[8] & 0x7F) << 7
+        | (data[9] & 0x7F)
+    )
+    return 10 + size
+
+
+def _mpeg1_layer3_frame_length(header: bytes) -> Optional[int]:
+    """
+    MPEG-1 Layer III フレーム長をヘッダから計算する。
+
+    Args:
+        header: 先頭 4 バイトのフレームヘッダ
+
+    Returns:
+        フレーム長（バイト）。対象外または不正なら None
+    """
+    if len(header) < 4:
+        return None
+    if header[0] != 0xFF or (header[1] & 0xE0) != 0xE0:
+        return None
+
+    version_id = (header[1] >> 3) & 0x03
+    layer = (header[1] >> 1) & 0x03
+    # 3 = MPEG-1, 1 = Layer III
+    if version_id != 3 or layer != 1:
+        return None
+
+    bitrate = _MPEG1_L3_BITRATES[(header[2] >> 4) & 0x0F] * 1000
+    sr_index = (header[2] >> 2) & 0x03
+    if bitrate == 0 or sr_index >= len(_MPEG1_SAMPLE_RATES):
+        return None
+    sample_rate = _MPEG1_SAMPLE_RATES[sr_index]
+    padding = (header[2] >> 1) & 0x01
+    return int(144 * bitrate / sample_rate) + padding
+
+
+def _iter_mpeg_frames(data: bytes, start: int) -> List[Tuple[int, int]]:
+    """
+    MPEG フレームの (オフセット, 長さ) 一覧を返す。
+
+    Args:
+        data: ファイル全体
+        start: 走査開始位置（ID3v2 の直後）
+
+    Returns:
+        フレーム位置のリスト
+    """
+    frames: List[Tuple[int, int]] = []
+    offset = start
+    while offset + 4 <= len(data):
+        if data[offset] == 0xFF and (data[offset + 1] & 0xE0) == 0xE0:
+            length = _mpeg1_layer3_frame_length(data[offset:offset + 4])
+            if length is None or offset + length > len(data):
+                break
+            frames.append((offset, length))
+            offset += length
+        else:
+            nxt = data.find(b"\xff", offset + 1)
+            if nxt < 0:
+                break
+            offset = nxt
+    return frames
+
+
+def _is_encoder_info_frame(frame: bytes) -> bool:
+    """
+    LAME / Xing / Info のエンコーダ情報フレームかどうかを判定する。
+
+    MPEG-1 ステレオでは side info の直後（オフセット 36）にタグが置かれる。
+
+    Args:
+        frame: 1 フレーム分のバイト列
+
+    Returns:
+        エンコーダ情報フレームなら True
+    """
+    if len(frame) < 40:
+        return False
+    tag = frame[36:40]
+    return tag in (b"LAME", b"Xing", b"Info")
+
+
+def strip_trailing_encoder_frames(output_path: str) -> int:
+    """
+    末尾に連なる LAME/Xing/Info フレームを取り除く。
+
+    元ファイル終端のエンコーダパディングがコピーされると、
+    WinAMP など古いデコーダがクラッシュすることがある。
+
+    Args:
+        output_path: 切り出し後の MP3 パス
+
+    Returns:
+        削除したフレーム数
+    """
+    path = Path(output_path)
+    data = path.read_bytes()
+    audio_start = _id3v2_size(data)
+    frames = _iter_mpeg_frames(data, audio_start)
+    if len(frames) <= 1:
+        return 0
+
+    drop_count = 0
+    while len(frames) > 1:
+        offset, length = frames[-1]
+        if not _is_encoder_info_frame(data[offset:offset + length]):
+            break
+        frames.pop()
+        drop_count += 1
+
+    if drop_count == 0:
+        return 0
+
+    last_offset, last_length = frames[-1]
+    path.write_bytes(data[: last_offset + last_length])
+    return drop_count
+
+
 def cut_segment(ffmpeg_exe: str, source: str, start: float, end: float, output: str) -> bool:
     """
-    FFmpegを使用してMP3ファイルから指定範囲を切り出す
+    FFmpegを使用してMP3ファイルから指定範囲を切り出す。
+
+    再エンコードは行わず、muxer による Info/Xing と ID3v2 の付与も抑止する。
     
     Args:
         ffmpeg_exe: FFmpeg実行ファイルのパス
@@ -149,14 +292,18 @@ def cut_segment(ffmpeg_exe: str, source: str, start: float, end: float, output: 
         成功時True、失敗時False
     """
     # FFmpegコマンドの構築
+    # write_xing=0 / id3v2_version=0 は、muxer が先頭へ挿入する
+    # ダミー Info/Xing フレームと ID3v2.4 を抑止する（WinAMP 等の古いデコーダ対策）
     cmd = [
         ffmpeg_exe,
         '-ss', str(start),
         '-to', str(end),
         '-i', source,
-        '-map_metadata', '-1',  # 全メタデータを削除
+        '-map_metadata', '-1',  # 入力メタデータを破棄
         '-vn',  # 動画ストリームを無効化
         '-c', 'copy',  # 再エンコードなし
+        '-write_xing', '0',  # ダミー Info/Xing フレームを書かない
+        '-id3v2_version', '0',  # ID3v2 タグを付けない
         '-y',  # 上書き確認なし
         output
     ]
@@ -176,7 +323,11 @@ def cut_segment(ffmpeg_exe: str, source: str, start: float, end: float, output: 
             print(f"  ✗ Failed to cut segment: {output}")
             print(f"    Error: {result.stderr}")
             return False
-        
+
+        dropped = strip_trailing_encoder_frames(output)
+        if dropped:
+            print(f"  Stripped {dropped} trailing encoder info frame(s)")
+
         print(f"  ✓ Successfully created: {output}")
         return True
         
